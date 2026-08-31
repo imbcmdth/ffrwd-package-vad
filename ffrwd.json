@@ -1,0 +1,39 @@
+{
+  "name": "ffrwd/vad",
+  "version": "0.1.0",
+  "description": "Voice activity detection with Silero VAD: the audio passes through untouched and every span of speech leaves as a cue.",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/imbcmdth/ffrwd-package-vad",
+  "capabilities": [
+    "nn"
+  ],
+  "dependencies": {
+    "ffrwd/wasm": "0.11.0"
+  },
+  "keywords": [
+    "vad",
+    "speech",
+    "voice",
+    "silence",
+    "cues",
+    "subtitles",
+    "chapters",
+    "silero",
+    "nn"
+  ],
+  "lib": {
+    "speech": "src/speech.sql"
+  },
+  "bin": {
+    "spans": "recipes/spans.sql",
+    "speech-track": "recipes/speech-track.sql"
+  },
+  "models": {
+    "speech": {
+      "repo": "onnx-community/silero-vad",
+      "revision": "e71cae966052b992a7eca6b17738916ce0eca4ec",
+      "file": "onnx/model.onnx",
+      "sha256": "a4a068cd6cf1ea8355b84327595838ca748ec29a25bc91fc82e6c299ccdc5808"
+    }
+  }
+}
