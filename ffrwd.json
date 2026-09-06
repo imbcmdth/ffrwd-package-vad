@@ -1,6 +1,6 @@
 {
   "name": "ffrwd/vad",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Voice activity detection with Silero VAD.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-vad",
