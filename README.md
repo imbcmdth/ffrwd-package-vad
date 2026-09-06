@@ -1,6 +1,6 @@
 # ffrwd/vad
 
-Voice activity detection with Silero VAD, hosted in wasm. `speech` hands
+Voice activity detection with Silero VAD. `speech` hands
 an audio stream back untouched with one cue per span of speech beside
 it, so a query can write the spans out, mark them on the clip, or hand
 them to a transcriber that then spends nothing on the silence.
@@ -38,7 +38,7 @@ install.
 - `speech-track` - the clip with a subtitle track marking the speech.
 
 ```
-ffrwd ffrwd.vad.spans -v source=interview.mp4 -v dest=spans.ndjson
+ffrwd run ffrwd/vad:spans -v source=interview.mp4 -v dest=spans.ndjson
 ```
 
 ## Building
