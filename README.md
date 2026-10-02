@@ -5,7 +5,7 @@ stream and writes a row for every 32 ms of speech in it, so a query can
 write the spans out, mark them on the clip, or hand them to a
 transcriber that then spends nothing on the silence.
 
-Requires ffrwd 0.29.
+Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1.
 
 ```pgsql
 COPY (

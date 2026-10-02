@@ -207,7 +207,7 @@ struct Speech<L: Listen = Model> {
 
 impl<L: Listen> Node for Speech<L> {
     const NAME: &'static str = "speech";
-    const VERSION: &'static str = "0.2.0";
+    const VERSION: &'static str = "0.2.1";
     const PARAMS_SCHEMA: &'static str = PARAMS_SCHEMA;
     type Params = Params;
 
