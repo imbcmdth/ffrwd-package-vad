@@ -1,6 +1,7 @@
-//! The arithmetic the module is built on: samples cut into the chunks the
-//! model takes, and per-chunk probabilities turned into spans of speech.
-//! Neither half touches the model, so both are tested on the host.
+//! The arithmetic the module is built on: per-chunk probabilities turned into
+//! spans of speech, and those spans into one row per chunk, each written once
+//! it is sure. None of it touches the model, so all of it is tested on the
+//! host.
 
 /// Samples one model chunk covers. Silero VAD v5 is trained on exactly this
 /// many at 16 kHz and accepts no other length.
@@ -12,12 +13,6 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Seconds one chunk covers: 32 ms, which is the resolution a span's edges
 /// can ever have.
 pub const CHUNK_SECONDS: f64 = CHUNK as f64 / SAMPLE_RATE as f64;
-
-/// A timestamp in the stream's own unit, as seconds. `den` is always
-/// positive, so a negative timestamp stays negative.
-pub fn seconds(ticks: i64, num: i32, den: i32) -> f64 {
-    ticks as f64 * f64::from(num) / f64::from(den)
-}
 
 /// One span of speech, in seconds from the start of the stream.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,6 +94,13 @@ impl Spans {
         self.close()
     }
 
+    /// Whether the open span is long enough to be kept, which it stays.
+    fn sure(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.voiced_to - open.start >= self.min_speech)
+    }
+
     /// The open span, if it is long enough to be one.
     fn close(&mut self) -> Option<Span> {
         let open = self.open.take()?;
@@ -110,196 +112,83 @@ impl Spans {
     }
 }
 
-/// Samples arriving in whatever pieces the host cuts, handed on in the fixed
-/// chunks the model takes.
+/// One row of the per-chunk rows: the chunk it is stamped at, and the second
+/// the span that chunk belongs to began.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Said {
+    pub pts: i64,
+    pub start_t: f64,
+}
+
+/// Spans written as they happen: a row for every chunk of a span, from its
+/// first voiced chunk to its last, each carrying the second the span began.
 ///
-/// The clock is counted in samples rather than added up per chunk, so a long
-/// stream's last span is timed as exactly as its first.
-pub struct Chunker {
-    /// Samples not yet a whole chunk.
-    pending: Vec<f32>,
-    /// The second `consumed` is counted from.
-    base: f64,
-    /// Samples handed on since `base`.
-    consumed: u64,
+/// A row is written once it is sure. The chunks of a span that may yet prove
+/// shorter than `min_speech` wait until it is long enough, and a quiet chunk
+/// inside one waits until speech resumes within `min_silence`. A span that is
+/// dropped writes nothing, and nor does the quiet that closes one, so the rows
+/// of a span run from its start to the end of its last voiced chunk, which is
+/// the span [`Spans`] closes.
+pub struct Speaking {
+    spans: Spans,
+    /// The chunks of the open span not yet written, oldest first.
+    waiting: Vec<i64>,
 }
 
-impl Default for Chunker {
-    fn default() -> Chunker {
-        Chunker::new()
-    }
-}
-
-impl Chunker {
-    pub fn new() -> Chunker {
-        Chunker {
-            pending: Vec::new(),
-            base: 0.0,
-            consumed: 0,
+impl Speaking {
+    pub fn new(threshold: f64, min_speech: f64, min_silence: f64) -> Speaking {
+        Speaking {
+            spans: Spans::new(threshold, min_speech, min_silence),
+            waiting: Vec::new(),
         }
     }
 
-    /// Whether nothing is held back, which is when a payload's own timestamp
-    /// may be believed over the count kept here.
-    pub fn aligned(&self) -> bool {
-        self.pending.is_empty()
+    /// Moves the threshold. The two durations stay: they decide how long a
+    /// row may wait, which the node declared when it opened.
+    pub fn retune(&mut self, threshold: f64) {
+        let (min_speech, min_silence) = (self.spans.min_speech, self.spans.min_silence);
+        self.spans.retune(threshold, min_speech, min_silence);
     }
 
-    /// Moves the clock onto `seconds`. Only meaningful while aligned.
-    pub fn seek(&mut self, seconds: f64) {
-        self.base = seconds;
-        self.consumed = 0;
-    }
-
-    /// The second sample `offset` sits at, counted from `base`.
-    fn at(&self, offset: u64) -> f64 {
-        self.base + offset as f64 / f64::from(SAMPLE_RATE)
-    }
-
-    /// The second the samples fed so far run out at, whole chunk or not.
-    pub fn end(&self) -> f64 {
-        self.at(self.consumed + self.pending.len() as u64)
-    }
-
-    /// Mono f32 samples as the host lays them out. Every whole chunk they
-    /// complete goes to `run` with the second that chunk starts at; a
-    /// remainder waits for the samples that finish it.
-    pub fn feed(&mut self, bytes: &[u8], mut run: impl FnMut(&[f32], f64)) {
-        let (words, _) = bytes.as_chunks::<4>();
-        self.pending
-            .extend(words.iter().copied().map(f32::from_le_bytes));
-
-        let Chunker {
-            pending,
-            base,
-            consumed,
-        } = self;
-        let mut taken = 0;
-        while pending.len() - taken >= CHUNK {
-            run(
-                &pending[taken..taken + CHUNK],
-                *base + *consumed as f64 / f64::from(SAMPLE_RATE),
-            );
-            *consumed += CHUNK as u64;
-            taken += CHUNK;
+    /// One chunk's probability, the pts it is stamped at and the second it
+    /// starts at, oldest first. Answers the rows this chunk made sure.
+    pub fn push(&mut self, probability: f64, pts: i64, start_t: f64) -> Vec<Said> {
+        self.spans.push(probability, start_t);
+        let Some(start_t) = self.spans.open.as_ref().map(|open| open.start) else {
+            self.waiting.clear();
+            return Vec::new();
+        };
+        self.waiting.push(pts);
+        if probability < self.spans.threshold || !self.spans.sure() {
+            return Vec::new();
         }
-        pending.drain(..taken);
+        self.waiting
+            .drain(..)
+            .map(|pts| Said { pts, start_t })
+            .collect()
     }
+}
+
+/// The most chunks a row waits behind the chunk it is stamped at.
+///
+/// The longest wait is the first chunk of a span voiced for one chunk short of
+/// `min_speech`, then quiet for one chunk short of closing, then voiced again:
+/// only that last chunk says the span is kept. Each duration is counted up to
+/// the next whole chunk and one past it when it falls on one, since a chunk
+/// boundary compared in floating point can land either side.
+pub fn latency_chunks(min_speech: f64, min_silence: f64) -> u32 {
+    let chunks = |seconds: f64| (seconds / CHUNK_SECONDS + 1e-6).floor() as u32 + 1;
+    chunks(min_speech) + chunks(min_silence) - 2
+}
+
+/// [`latency_chunks`] in seconds, which is what the node declares.
+pub fn latency(min_speech: f64, min_silence: f64) -> f64 {
+    f64::from(latency_chunks(min_speech, min_silence)) * CHUNK as f64 / f64::from(SAMPLE_RATE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The bytes a host hands over for these samples.
-    fn bytes(samples: &[f32]) -> Vec<u8> {
-        samples.iter().flat_map(|s| s.to_le_bytes()).collect()
-    }
-
-    /// A tone at `hz`, which is what a burst of speech stands in for here:
-    /// the chunker never looks at the values, only counts them.
-    fn tone(count: usize, hz: f64) -> Vec<f32> {
-        (0..count)
-            .map(|i| (std::f64::consts::TAU * hz * i as f64 / f64::from(SAMPLE_RATE)).sin() as f32)
-            .collect()
-    }
-
-    /// Every chunk the feeds produce, as (first sample, start second).
-    fn chunks_of(chunker: &mut Chunker, feeds: &[Vec<f32>]) -> Vec<(f32, f64)> {
-        let mut seen = Vec::new();
-        for feed in feeds {
-            chunker.feed(&bytes(feed), |chunk, at| seen.push((chunk[0], at)));
-        }
-        seen
-    }
-
-    #[test]
-    fn a_timestamp_becomes_seconds_in_the_streams_own_unit() {
-        assert_eq!(seconds(16_000, 1, 16_000), 1.0);
-        assert_eq!(seconds(48_000, 1, 48_000), 1.0);
-        assert_eq!(seconds(0, 1, 16_000), 0.0);
-        // A frame rate's unit, which an audio instance may still be counted
-        // in when the container says so.
-        assert!((seconds(30, 1, 25) - 1.2).abs() < 1e-12);
-    }
-
-    #[test]
-    fn samples_are_handed_on_a_whole_chunk_at_a_time() {
-        let mut chunker = Chunker::new();
-        let seen = chunks_of(&mut chunker, &[tone(CHUNK * 3, 440.0)]);
-        assert_eq!(seen.len(), 3);
-        for (index, (_, at)) in seen.iter().enumerate() {
-            assert!(
-                (at - index as f64 * CHUNK_SECONDS).abs() < 1e-12,
-                "chunk {index} starts at {at}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_remainder_waits_for_the_samples_that_finish_it() {
-        let mut chunker = Chunker::new();
-        assert_eq!(
-            chunks_of(&mut chunker, &[tone(CHUNK + 100, 440.0)]).len(),
-            1
-        );
-        assert!(!chunker.aligned(), "100 samples are held back");
-
-        // The next feed brings the 412 that finish the chunk they started.
-        let seen = chunks_of(&mut chunker, &[tone(CHUNK - 100, 440.0)]);
-        assert_eq!(seen.len(), 1);
-        assert!(
-            (seen[0].1 - CHUNK_SECONDS).abs() < 1e-12,
-            "and it starts where the first one ended"
-        );
-        assert!(chunker.aligned());
-    }
-
-    #[test]
-    fn a_chunk_carries_the_samples_that_went_in() {
-        // Each chunk's first sample marks which one it is.
-        let mut samples = tone(CHUNK * 2, 440.0);
-        samples[0] = -1.0;
-        samples[CHUNK] = -2.0;
-        let mut chunker = Chunker::new();
-        let seen = chunks_of(&mut chunker, &[samples]);
-        assert_eq!(seen[0].0, -1.0);
-        assert_eq!(seen[1].0, -2.0);
-    }
-
-    #[test]
-    fn the_clock_starts_where_the_stream_is_seeked_to() {
-        let mut chunker = Chunker::new();
-        chunker.seek(12.5);
-        let seen = chunks_of(&mut chunker, &[tone(CHUNK * 2, 440.0)]);
-        assert!((seen[0].1 - 12.5).abs() < 1e-12);
-        assert!((seen[1].1 - (12.5 + CHUNK_SECONDS)).abs() < 1e-12);
-        assert!((chunker.end() - (12.5 + 2.0 * CHUNK_SECONDS)).abs() < 1e-12);
-    }
-
-    #[test]
-    fn the_end_counts_the_samples_still_held_back() {
-        let mut chunker = Chunker::new();
-        chunks_of(&mut chunker, &[tone(CHUNK + 160, 440.0)]);
-        // A chunk handed on plus 160 samples, which is 10 ms at 16 kHz.
-        assert!((chunker.end() - (CHUNK_SECONDS + 0.01)).abs() < 1e-12);
-    }
-
-    #[test]
-    fn an_hours_worth_of_chunks_is_still_timed_exactly() {
-        // Adding a chunk's length up per chunk would drift; counting samples
-        // does not. 112500 chunks is an hour.
-        let mut chunker = Chunker::new();
-        let mut last = 0.0;
-        for _ in 0..112_500 {
-            chunker.feed(&bytes(&vec![0.0; CHUNK]), |_, at| last = at);
-        }
-        let expected = (112_499 * CHUNK) as f64 / f64::from(SAMPLE_RATE);
-        assert!(
-            (last - expected).abs() < 1e-9,
-            "the last chunk is at {last}"
-        );
-    }
 
     /// Chunk probabilities pushed in order from second zero, and the spans
     /// that came out including whatever the end of the stream closed.
@@ -448,5 +337,176 @@ mod tests {
         assert_eq!(spans_of(&mut lenient, &probabilities).len(), 1);
         let mut strict = Spans::new(0.9, 0.25, 0.1);
         assert!(spans_of(&mut strict, &probabilities).is_empty());
+    }
+
+    /// A sequence of probabilities that wanders in and out of speech, the
+    /// same every run: a linear congruential generator, so no crate is
+    /// needed for it.
+    fn wandering(seed: u64, count: usize) -> Vec<f64> {
+        let mut state = seed;
+        let mut voiced = false;
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let draw = (state >> 33) as f64 / f64::from(1u32 << 31);
+                if draw < 0.2 {
+                    voiced = !voiced;
+                }
+                if voiced {
+                    0.5 + draw / 2.0
+                } else {
+                    draw / 2.0
+                }
+            })
+            .collect()
+    }
+
+    /// The rows written for `probabilities`, chunk `n` stamped at pts `n`, as
+    /// (row, the chunk whose push wrote it).
+    fn rows_of(speaking: &mut Speaking, probabilities: &[f64]) -> Vec<(Said, usize)> {
+        let mut written = Vec::new();
+        for (index, p) in probabilities.iter().enumerate() {
+            for said in speaking.push(*p, index as i64, index as f64 * CHUNK_SECONDS) {
+                written.push((said, index));
+            }
+        }
+        written
+    }
+
+    /// The rows merged the way the host's span reducer merges them: rows
+    /// sharing a start are one span, ending at the end of its last chunk.
+    fn merged(written: &[(Said, usize)]) -> Vec<Span> {
+        let mut spans: Vec<Span> = Vec::new();
+        for (said, _) in written {
+            let end_t = (said.pts + 1) as f64 * CHUNK_SECONDS;
+            match spans.last_mut() {
+                Some(span) if span.start_t == said.start_t => span.end_t = end_t,
+                _ => spans.push(Span {
+                    start_t: said.start_t,
+                    end_t,
+                }),
+            }
+        }
+        spans
+    }
+
+    const PARAMS: [(f64, f64, f64); 5] = [
+        (0.5, 0.25, 0.1),
+        (0.5, 0.0, 0.0),
+        (0.6, 0.5, 0.3),
+        (0.4, 0.1, 0.25),
+        (0.5, 0.256, 0.064),
+    ];
+
+    #[test]
+    fn the_rows_merge_back_into_the_spans_a_span_list_would_close() {
+        for (threshold, min_speech, min_silence) in PARAMS {
+            for seed in 0..40 {
+                let probabilities = wandering(seed, 400);
+                let mut spans = Spans::new(threshold, min_speech, min_silence);
+                let closed = spans_of(&mut spans, &probabilities);
+                let mut speaking = Speaking::new(threshold, min_speech, min_silence);
+                let rows = merged(&rows_of(&mut speaking, &probabilities));
+                assert_eq!(rows.len(), closed.len(), "seed {seed}");
+                for (row, span) in rows.iter().zip(&closed) {
+                    assert!(
+                        (row.start_t - span.start_t).abs() < 1e-9
+                            && (row.end_t - span.end_t).abs() < 1e-9,
+                        "seed {seed}: {row:?} against {span:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_row_waits_longer_than_the_latency_declared_for_it() {
+        for (threshold, min_speech, min_silence) in PARAMS {
+            let most = latency_chunks(min_speech, min_silence) as usize;
+            for seed in 0..40 {
+                let mut speaking = Speaking::new(threshold, min_speech, min_silence);
+                for (said, at) in rows_of(&mut speaking, &wandering(seed, 400)) {
+                    let waited = at - said.pts as usize;
+                    assert!(waited <= most, "seed {seed}: waited {waited} of {most}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_longest_wait_is_a_short_span_that_resumes_just_before_it_closes() {
+        // Seven voiced chunks are 224 ms, under the 250 ms kept; three quiet
+        // ones are 96 ms, under the 100 ms that closes; the eleventh chunk is
+        // voiced and is what says the first one is speech.
+        let mut speaking = Speaking::new(0.5, 0.25, 0.1);
+        let probabilities = [run(7, 0.9), run(3, 0.1), run(1, 0.9)].concat();
+        let written = rows_of(&mut speaking, &probabilities);
+        assert_eq!(written.len(), 11, "every chunk of the span, quiet ones too");
+        assert_eq!(
+            written[0],
+            (
+                Said {
+                    pts: 0,
+                    start_t: 0.0
+                },
+                10
+            )
+        );
+        assert_eq!(latency_chunks(0.25, 0.1), 10);
+        assert!((latency(0.25, 0.1) - 0.32).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_dropped_span_and_the_quiet_that_closes_one_write_nothing() {
+        let mut speaking = Speaking::new(0.5, 0.25, 0.1);
+        // A burst of four, then quiet long enough to close it.
+        assert!(rows_of(&mut speaking, &[run(4, 0.9), run(10, 0.1)].concat()).is_empty());
+        let mut speaking = Speaking::new(0.5, 0.25, 0.1);
+        let written = rows_of(&mut speaking, &[run(10, 0.9), run(10, 0.1)].concat());
+        assert_eq!(written.len(), 10, "the voiced chunks and none of the quiet");
+        assert!(written.iter().all(|(said, _)| said.start_t == 0.0));
+    }
+
+    #[test]
+    fn a_row_carries_the_second_its_span_began() {
+        let mut speaking = Speaking::new(0.5, 0.25, 0.1);
+        let written = rows_of(
+            &mut speaking,
+            &[run(5, 0.1), run(10, 0.9), run(2, 0.1), run(5, 0.9)].concat(),
+        );
+        let begun = 5.0 * CHUNK_SECONDS;
+        assert_eq!(written.len(), 17);
+        assert!(written.iter().all(|(said, _)| said.start_t == begun));
+        let pts: Vec<i64> = written.iter().map(|(said, _)| said.pts).collect();
+        assert_eq!(
+            pts,
+            (5..22).collect::<Vec<_>>(),
+            "in order, the gap included"
+        );
+    }
+
+    #[test]
+    fn a_threshold_moved_live_keeps_the_durations() {
+        let mut speaking = Speaking::new(0.5, 0.25, 0.1);
+        speaking.retune(0.9);
+        assert!(rows_of(&mut speaking, &[run(20, 0.6), run(10, 0.1)].concat()).is_empty());
+        assert_eq!(speaking.spans.min_speech, 0.25);
+        assert_eq!(speaking.spans.min_silence, 0.1);
+    }
+
+    #[test]
+    fn the_latency_is_a_whole_number_of_chunks_in_samples() {
+        // The host holds a port's progress back by the latency in its time
+        // base, rounded up: a whole number of chunks keeps the progress, and
+        // so the span reducer's end of a span, on a chunk boundary.
+        for min_speech in [0.0, 0.1, 0.25, 0.256, 0.5, 1.0, 2.0] {
+            for min_silence in [0.0, 0.05, 0.1, 0.25, 0.5, 1.0] {
+                let chunks = latency_chunks(min_speech, min_silence);
+                let samples = (latency(min_speech, min_silence) * f64::from(SAMPLE_RATE)).ceil();
+                assert_eq!(samples as u64, u64::from(chunks) * CHUNK as u64);
+            }
+        }
     }
 }
